@@ -61,6 +61,8 @@
 #define MICRO 0.000001
 #define MILLI 0.001
 
+std::map <uint256, int64_t> mapRejectedBlocks GUARDED_BY(cs_main);
+
 bool CBlockIndexWorkComparator::operator()(const CBlockIndex *pa, const CBlockIndex *pb) const {
     // First sort by most total work, ...
     if (pa->nChainWork > pb->nChainWork) return false;
@@ -2651,7 +2653,7 @@ bool CChainState::ConnectTip(CValidationState& state, const CChainParams& chainp
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-bool DisconnectBlocks(int blocks)
+bool CChainState::DisconnectBlocks(int blocks)
 {
     LOCK(cs_main);
 
@@ -2661,7 +2663,7 @@ bool DisconnectBlocks(int blocks)
     LogPrintf("DisconnectBlocks -- Got command to replay %d blocks\n", blocks);
     for(int i = 0; i < blocks; i++) {
         DisconnectedBlockTransactions disconnectpool;
-        if(!g_chainstate.DisconnectTip(state, chainparams,&disconnectpool) || !state.IsValid()) {
+        if(!DisconnectTip(state, chainparams,&disconnectpool) || !state.IsValid()) {
             // This is likely a fatal error, but keep the mempool consistent,
             // just in case. Only remove from the mempool in this case.
             UpdateMempoolForReorg(disconnectpool, false);
@@ -2671,7 +2673,7 @@ bool DisconnectBlocks(int blocks)
     return true;
 }
 
-void ReprocessBlocks(int nBlocks)
+void CChainState::ReprocessBlocks(int nBlocks)
 {
     LOCK(cs_main);
 
