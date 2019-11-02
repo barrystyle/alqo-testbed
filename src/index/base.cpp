@@ -77,6 +77,13 @@ static const CBlockIndex* NextSyncBlock(const CBlockIndex* pindex_prev) EXCLUSIV
         return ::ChainActive().Genesis();
     }
 
+    // Always consult the most-work chain we have, whether or not it is based on
+    // an unvalidated snapshot. If we return a CBlockIndex for which we don't
+    // yet have block data (e.g. in the case of being in the middle of background
+    // snapshot validation), the `ReadBlockFromDisk()` check will fail in
+    // `ThreadSync()` and we will halt index building until next startup
+    // (when, presumably, we'll have more block data to proceed off of).
+    //
     const CBlockIndex* pindex = ::ChainActive().Next(pindex_prev);
     if (pindex) {
         return pindex;
@@ -223,12 +230,22 @@ void BaseIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const
     }
 
     if (WriteBlock(*block, pindex)) {
-        m_best_block_index = pindex;
+        if (pindex->nHeight > best_block_index->nHeight) {
+            m_best_block_index = pindex;
+        }
     } else {
         FatalError("%s: Failed to write block %s to index",
                    __func__, pindex->GetBlockHash().ToString());
         return;
     }
+}
+
+void BaseIndex::BackgroundBlockConnected(
+    const std::shared_ptr<const CBlock>& block,
+    const CBlockIndex* pindex,
+    const std::vector<CTransactionRef>& txn_conflicted)
+{
+    this->BlockConnected(block, pindex, txn_conflicted);
 }
 
 void BaseIndex::ChainStateFlushed(const CBlockLocator& locator)

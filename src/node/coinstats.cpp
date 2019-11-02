@@ -18,7 +18,9 @@
 
 #include <boost/thread.hpp>
 
-
+//! XXX: be very careful when changing this! assumeutuxo and UTXO snapshot
+//! validation commitments are reliant on the hash constructed by this
+//! function.
 static void ApplyStats(CCoinsStats &stats, CHashWriter& ss, const uint256& hash, const std::map<uint32_t, Coin>& outputs)
 {
     assert(!outputs.empty());
@@ -51,6 +53,7 @@ bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
     }
     ss << stats.hashBlock;
     uint256 prevkey;
+    unsigned int coins_count{0};
     std::map<uint32_t, Coin> outputs;
     while (pcursor->Valid()) {
         boost::this_thread::interruption_point();
@@ -63,6 +66,7 @@ bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
             }
             prevkey = key.hash;
             outputs[key.n] = std::move(coin);
+            coins_count += 1;
         } else {
             return error("%s: unable to read value", __func__);
         }
@@ -73,5 +77,6 @@ bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
     }
     stats.hashSerialized = ss.GetHash();
     stats.nDiskSize = view->EstimateSize();
+    stats.coins_count = coins_count;
     return true;
 }

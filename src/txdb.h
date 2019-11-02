@@ -46,7 +46,9 @@ static const int64_t nMaxCoinsDBCache = 8;
 class CCoinsViewDB final : public CCoinsView
 {
 protected:
-    CDBWrapper db;
+    std::unique_ptr<CDBWrapper> db;
+    fs::path m_ldb_path;
+    bool m_is_memory;
 public:
     /**
      * @param[in] ldb_path    Location in the filesystem where leveldb data will be stored.
@@ -57,12 +59,18 @@ public:
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
-    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) override;
+    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
     CCoinsViewCursor *Cursor() const override;
 
     //! Attempt to update from an older database format. Returns whether an error occurred.
     bool Upgrade();
     size_t EstimateSize() const override;
+
+    //! Dynamically alter the underlying leveldb cache size.
+    void ResizeCache(size_t new_cache_size);
+
+    //! Mark the on-disk leveldb database for deletion.
+    void MarkForDeletion() { return db->MarkForDeletion(); }
 };
 
 /** Specialization of CCoinsViewCursor to iterate over a CCoinsViewDB */

@@ -13,6 +13,7 @@
 #include <node/coinstats.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <fs.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
 #include <policy/feerate.h>
@@ -993,7 +994,10 @@ static UniValue gettxoutsetinfo(const JSONRPCRequest& request)
     UniValue ret(UniValue::VOBJ);
 
     CCoinsStats stats;
-    ::ChainstateActive().ForceFlushStateToDisk();
+    {
+        LOCK(::cs_main);
+        ::ChainstateActive().ForceFlushStateToDisk();
+    }
 
     CCoinsView* coins_view = WITH_LOCK(cs_main, return &ChainstateActive().CoinsDB());
     if (GetUTXOStats(coins_view, stats)) {
@@ -1117,7 +1121,7 @@ static UniValue verifychain(const JSONRPCRequest& request)
         nCheckDepth = request.params[1].get_int();
 
     return CVerifyDB().VerifyDB(
-        Params(), &::ChainstateActive().CoinsTip(), nCheckLevel, nCheckDepth);
+        ::ChainstateActive(), Params(), ::ChainstateActive().CoinsTip(), nCheckLevel, nCheckDepth);
 }
 
 static void BuriedForkDescPushBack(UniValue& softforks, const std::string &name, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
@@ -1337,7 +1341,7 @@ static UniValue getchaintips(const JSONRPCRequest& request)
     /*
      * Idea:  the set of chain tips is ::ChainActive().tip, plus orphan blocks which do not have another orphan building off of them.
      * Algorithm:
-     *  - Make one pass through g_blockman.m_block_index, picking out the orphan blocks, and also storing a set of the orphan block's pprev pointers.
+     *  - Make one pass through BlockIndex(), picking out the orphan blocks, and also storing a set of the orphan block's pprev pointers.
      *  - Iterate through the orphan blocks. If the block isn't pointed to by another orphan, it is a chain tip.
      *  - add ::ChainActive().Tip()
      */
@@ -2247,6 +2251,226 @@ static UniValue getblockfilter(const JSONRPCRequest& request)
     return ret;
 }
 
+/**
+ * Serialize the UTXO set to a file for loading elsewhere.
+ *
+ * @see SnapshotMetadata
+ */
+UniValue dumptxoutset(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            RPCHelpMan{
+                "dumptxoutset",
+                "\nWrite the serialized UTXO set to disk.\n"
+                "Incidentally flushes the latest coinsdb (leveldb) to disk.\n",
+                {
+                    {"path",
+                        RPCArg::Type::STR,
+                        RPCArg::Optional::NO,
+                        /* default_val */ "",
+                        "path to the output file. If relative, will be prefixed by datadir."},
+                },
+                RPCResults{},
+                RPCExamples{"{\n"
+            "  \"coins_written\": n,   (numeric) the number of coins written in the snapshot\n"
+            "  \"base_hash\": \"...\",   (string) the hash of the base of the snapshot\n"
+            "  \"base_height\": n,     (string) the height of the base of the snapshot\n"
+            "  \"path\": \"...\"         (string) the absolute path that the snapshot was written to\n"
+            "  \"assumeutxo\": \"...\"   (hash) the hash of the UTXO set contents\n"
+            "]\n"},
+            }.ToString()
+        );
+
+    fs::path path = request.params[0].get_str();
+
+    if (path.is_relative()) {
+        path = fs::absolute(path, GetDataDir());
+    }
+    if (fs::exists(path)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            path.string() + " already exists. If you are sure this is what you want, "
+            "move it out of the way first");
+    }
+
+    FILE* file{fsbridge::fopen(path, "wb")};
+    CAutoFile afile{file, SER_DISK, CLIENT_VERSION};
+    std::unique_ptr<CCoinsViewCursor> pcursor;
+    CCoinsStats stats;
+    CBlockIndex* tip;
+
+    {
+        // We need to lock cs_main to ensure that the coinsdb isn't written to
+        // between (i) flushing coins cache to disk (coinsdb), (ii) getting stats
+        // based upon the coinsdb, and (iii) constructing a cursor to the
+        // coinsdb for use below this block.
+        //
+        // Cursors returned by leveldb iterate over snapshots, so the contents
+        // of the pcursor will not be affected by simultaneous writes during
+        // use below this block.
+        //
+        // See discussion here:
+        //   https://github.com/bitcoin/bitcoin/pull/15606#discussion_r274479369
+        //
+        LOCK(::cs_main);
+
+        ::ChainstateActive().ForceFlushStateToDisk();
+
+        if (!GetUTXOStats(&::ChainstateActive().CoinsDB(), stats)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read UTXO set");
+        }
+
+        pcursor = std::unique_ptr<CCoinsViewCursor>(::ChainstateActive().CoinsDB().Cursor());
+        tip = LookupBlockIndex(stats.hashBlock);
+        assert(tip);
+    }
+
+    SnapshotMetadata metadata{
+        CDiskBlockIndex(tip), stats.hashSerialized, stats.coins_count, tip->nChainTx};
+
+    afile << metadata;
+
+    while (pcursor->Valid()) {
+        boost::this_thread::interruption_point();
+        COutPoint key;
+        Coin coin;
+        if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
+            afile << key;
+            afile << coin;
+        }
+
+        pcursor->Next();
+    }
+
+    afile.fclose();
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("coins_written", stats.coins_count);
+    result.pushKV("base_hash", tip->GetBlockHash().ToString());
+    result.pushKV("base_height", tip->nHeight);
+    result.pushKV("path", path.string());
+    result.pushKV("assumeutxo", stats.hashSerialized.ToString());
+    return result;
+}
+
+UniValue loadtxoutset(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            RPCHelpMan{"loadtxoutset",
+                "\nLoad the serialized UTXO set from disk.\n",
+                {
+                    {"path",
+                        RPCArg::Type::STR,
+                        RPCArg::Optional::NO,
+                        /* default_val */ "",
+                        "path to the snapshot file. If relative, will be prefixed by datadir."},
+                },
+                RPCResults{},
+                RPCExamples{"{\n"
+                "  \"coins_loaded\": n,   (numeric) the number of coins loaded by the snapshot\n"
+                "  \"tip_hash\": \"...\",   (string) the hash of the new tip\n"
+                "  \"tip_height\": n,     (string) the height of the new chain\n"
+                "  \"path\": \"...\"         (string) the absolute path that the snapshot was loaded\n"
+                "]\n"},
+            }.ToString()
+        );
+
+    fs::path path = request.params[0].get_str();
+    if (path.is_relative()) {
+        path = fs::absolute(path, GetDataDir());
+    }
+    FILE* file{fsbridge::fopen(path, "rb")};
+    CAutoFile afile{file, SER_DISK, CLIENT_VERSION};
+    SnapshotMetadata metadata;
+    afile >> metadata;
+
+    uint256 base_blockhash = metadata.m_base_blockheader.GetBlockHash();
+    int max_secs_to_wait_for_headers = 60 * 10;
+    CBlockIndex* snapshot_start_block = nullptr;
+
+    LogPrintf("[snapshot] waiting to see blockheader %s in headers chain before snapshot activation\n",
+        base_blockhash.ToString());
+
+    while (max_secs_to_wait_for_headers > 0) {
+        {
+            LOCK(cs_main);
+            snapshot_start_block = LookupBlockIndex(base_blockhash);
+        }
+        max_secs_to_wait_for_headers -= 1;
+        boost::this_thread::interruption_point();
+
+        if (!snapshot_start_block) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        } else {
+            break;
+        }
+    }
+
+    if (snapshot_start_block == nullptr) {
+        LogPrintf("[snapshot] timed out waiting for snapshot start blockheader %s\n",
+            base_blockhash.ToString());
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Timed out waiting for base block header to appear in headers chain");
+    }
+
+    // TODO jamesob: no real need to lock cs_main here, but during testing it makes it
+    // easier to follow the logs. We may want to remove this before merge.
+    //
+    LOCK(::cs_main);
+
+    if (!g_chainman.ActivateSnapshot(&afile, metadata, false)) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to load UTXO snapshot " + path.string());
+    }
+    CBlockIndex* new_tip{::ChainActive().Tip()};
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("coins_loaded", metadata.m_coins_count);
+    result.pushKV("tip_hash", new_tip->GetBlockHash().ToString());
+    result.pushKV("base_height", new_tip->nHeight);
+    result.pushKV("path", path.string());
+    return result;
+}
+
+UniValue monitorsnapshot(const JSONRPCRequest& request)
+{
+
+    LOCK(cs_main);
+    UniValue obj(UniValue::VOBJ);
+
+    auto make_chain_data = [](CChainState* cs) {
+        UniValue data(UniValue::VOBJ);
+        if (!cs || !cs->m_chain.Tip()) {
+            return data;
+        }
+        const CChain& chain = cs->m_chain;
+        const CBlockIndex* tip = chain.Tip();
+
+        data.pushKV("blocks",                (int)chain.Height());
+        data.pushKV("bestblockhash",         tip->GetBlockHash().GetHex());
+        data.pushKV("difficulty",            (double)GetDifficulty(tip));
+        data.pushKV("mediantime",            (int64_t)tip->GetMedianTimePast());
+        data.pushKV("verificationprogress",  GuessVerificationProgress(Params().TxData(), tip));
+        data.pushKV("snapshot_blockhash",    cs->m_from_snapshot_blockhash.ToString());
+        data.pushKV("initialblockdownload",  cs->IsInitialBlockDownload());
+        return data;
+    };
+
+    obj.pushKV("active_chain_type",
+        ::ChainstateActive().m_from_snapshot_blockhash.IsNull() ?
+        "ibd" : "snapshot");
+
+    for (CChainState* chainstate : g_chainman.GetAll()) {
+        std::string cstype = chainstate->m_from_snapshot_blockhash.IsNull() ? "ibd" : "snapshot";
+        obj.pushKV(cstype, make_chain_data(chainstate));
+    }
+    obj.pushKV("headers", pindexBestHeader ? pindexBestHeader->nHeight : -1);
+
+    return obj;
+}
+
 // clang-format off
 static const CRPCCommand commands[] =
 { //  category              name                      actor (function)         argNames
@@ -2275,6 +2499,9 @@ static const CRPCCommand commands[] =
     { "blockchain",         "preciousblock",          &preciousblock,          {"blockhash"} },
     { "blockchain",         "scantxoutset",           &scantxoutset,           {"action", "scanobjects"} },
     { "blockchain",         "getblockfilter",         &getblockfilter,         {"blockhash", "filtertype"} },
+    { "blockchain",         "dumptxoutset",           &dumptxoutset,           {"path"} },
+    { "blockchain",         "loadtxoutset",           &loadtxoutset,           {"path"} },
+    { "blockchain",         "monitorsnapshot",        &monitorsnapshot,        {} },
 
     /* Not shown in help */
     { "hidden",             "invalidateblock",        &invalidateblock,        {"blockhash"} },
