@@ -2398,7 +2398,7 @@ void static UpdateTip(const CBlockIndex *pindexNew, const CChainParams& chainPar
     // or only pertains to the primary coins view, so bail otherwise.
     if (&coins_view != &::ChainstateActive().CoinsTip()) {
         // Only log every so often so that we don't bury log messages at the tip.
-        if (pindexNew->nHeight % 2000 == 0) {
+        if (pindexNew->nHeight % 25 == 0) {
             log_progress("[background validation] ", "");
         }
         return;
@@ -5595,7 +5595,7 @@ bool ChainstateManager::PopulateAndValidateSnapshot(
         //
         // If our average Coin size is roughly 41 bytes, checking every 120,000 coins
         // means <5MB of memory imprecision.
-        if (coins_processed % 120000 == 0) {
+        if (coins_processed % 30000 == 0) {
             if (ShutdownRequested()) {
                 return false;
             }
